@@ -109,12 +109,19 @@ public:
 
 	// The original sets the "sequence timing" to 109 Hz, whatever that
 	// means. The default is 120.
-	uint32 getBaseTempo()	{ return _driver ? (109 * _driver->getBaseTempo()) / 120 : 0; }
+	uint32 getBaseTempo() {
+		if (TinselV1PSX) {
+			// PSX plays things a bit faster
+			return _driver ? _driver->getBaseTempo() : 0;
+		}
+		return _driver ? (109 * _driver->getBaseTempo()) / 120 : 0;
+	}
 
 	bool _milesAudioMode;
 
 private:
 	void playXMIDI(uint32 size, bool loop);
+	Common::SeekableReadStream *loadSoundFont(const Common::String &baseName);
 	void playSEQ(uint32 size, bool loop);
 };
 

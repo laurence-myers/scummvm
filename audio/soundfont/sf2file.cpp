@@ -114,17 +114,7 @@ SF2File::SF2File(SynthFile *synthfile) : RiffFile(synthfile->_name, "sfbk") {
 		memcpy(presetHdr.achPresetName, instr->_name.c_str(),
 			   MIN((unsigned long) instr->_name.size(), (unsigned long) 20));
 		presetHdr.wPreset = (uint16) instr->_ulInstrument;
-
-		// Despite being a 16-bit value, SF2 only supports banks up to 127. Since
-		// it's pretty common to have either MSB or LSB be 0, we'll use whatever
-		// one is not zero, with preference for MSB.
-		uint16 bank16 = (uint16) instr->_ulBank;
-
-		if ((bank16 & 0xFF00) == 0) {
-			presetHdr.wBank = bank16 & 0x7F;
-		} else {
-			presetHdr.wBank = (bank16 >> 8) & 0x7F;
-		}
+		presetHdr.wBank = static_cast<uint16>(instr->_ulBank);
 		presetHdr.wPresetBagNdx = (uint16) i;
 		presetHdr.dwLibrary = 0;
 		presetHdr.dwGenre = 0;

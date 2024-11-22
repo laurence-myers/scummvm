@@ -30,6 +30,9 @@
 #include "audio/miles.h"
 // Discworld Noir
 #include "audio/decoders/mp3.h"
+// Discworld 1 PSX
+#include "audio/soundfont/vgmcoll.h"
+#include "audio/soundfont/vab/vab.h"
 
 #include "backends/audiocd/audiocd.h"
 
@@ -504,6 +507,19 @@ MidiMusicPlayer::MidiMusicPlayer(TinselEngine *vm) {
 			_milesAudioMode = true;
 		}
 
+	} else if (TinselV1PSX) {
+		MidiPlayer::createDriver(MDT_PREFER_FLUID | MDT_SUPPLIED_SOUND_FONT | MDT_MIDI);
+
+		if (_driver->acceptsSoundFontData()) {
+			debug("Will use PSX music with dynamically loaded Soundfonts");
+			_driver->setTimerCallback(this, &timerCallback);
+			// Don't try opening it yet. We will open the driver for each music file, so we can load a new SoundFont.
+			return;
+		} else {
+			// If the selected driver doesn't support loading soundfont we should assume we got a fluid Synth V1 and reload
+			delete _driver;
+			MidiPlayer::createDriver();
+		}
 	} else {
 		MidiPlayer::createDriver();
 	}
@@ -588,13 +604,70 @@ void MidiMusicPlayer::playXMIDI(uint32 size, bool loop) {
 	}
 }
 
-void MidiMusicPlayer::playSEQ(uint32 size, bool loop) {
+Common::SeekableReadStream *MidiMusicPlayer::loadSoundFont(const Common::String &baseName) {
+	const Common::Path vhName(baseName + ".VH");
+	Common::File vhFile;
+	if (!vhFile.open(vhName)) {
+		error("Failed to open VH file '%s'", vhName.toString().c_str());
+	}
+
+	const Common::Path vbName(baseName + ".VB");
+	Common::File vbFile;
+	if (!vbFile.open(vbName)) {
+		error("Failed to open VB file '%s'", vbName.toString().c_str());
+	}
+
+	const uint32 headSize { static_cast<uint32>(vhFile.size()) };
+	const uint32 bodySize { static_cast<uint32>(vbFile.size()) };
+	const uint32 vabSize { headSize + bodySize };
+	debug("Reading VAB data. Head: %d. Body: %d. Combined: %d", headSize, bodySize, vabSize);
+
+	byte *vabData{static_cast<byte *>(malloc(vabSize))};
+
+	if (vhFile.read(vabData, headSize) != headSize) {
+		error("Failed to read VH file '%s'", vhName.toString().c_str());
+	}
+	vhFile.close();
+	
+	if (vbFile.read(vabData + headSize, bodySize) != bodySize) {
+		error("Failed to read VB file '%s'", vbName.toString().c_str());
+	}
+	vbFile.close();
+
+	MemFile *memFile = new MemFile(vabData, vabSize);
+	
+	debug("Loading SoundFont2 from VH/VB files, for song %s.", baseName.c_str());
+	Vab *vab = new Vab(memFile, 0);
+	vab->LoadVGMFile();
+	for (VGMInstr * instr : vab->_aInstrs) {
+		// Need to mark instrument 9 (MIDI channel 10) as a percussion bank
+		if (instr->_instrNum == 9) {
+			instr->_bank = 128;
+		}
+		debug("VAB instrument bank: %d, instrNum: %d", instr->_bank, instr->_instrNum);
+	}
+	VGMColl vabCollection;
+	SF2File *file = vabCollection.CreateSF2File(vab);
+	const byte *bytes = static_cast<const byte *>(file->SaveToMem());
+	const uint32 size = file->GetSize();
+
+	delete file;
+	delete vab;
+	delete memFile;
+
+	return new Common::MemoryReadStream(bytes, size, DisposeAfterUse::YES);
+}
+
+void MidiMusicPlayer::playSEQ(const uint32 size, const bool loop) {
 	uint8 *midiData = _vm->_music->GetMidiBuffer();
 	// MIDI.DAT holds the file names in DW1 PSX
-	Common::String baseName((char *)midiData, size);
-	Common::Path seqName(baseName + ".SEQ");
+	const Common::String baseName((char *)midiData, size);
+	const Common::Path seqName(baseName + ".SEQ");
 
-	// TODO: Load the instrument bank (<baseName>.VB and <baseName>.VH)
+	// Load the instrument bank (<baseName>.VB and <baseName>.VH)
+	_driver->close();
+	_driver->setEngineSoundFont(loadSoundFont(baseName));
+	_driver->open();
 
 	Common::File seqFile;
 	if (!seqFile.open(seqName))
@@ -616,28 +689,66 @@ void MidiMusicPlayer::playSEQ(uint32 size, bool loop) {
 	// and convert to SMF and then use the SMF MidiParser.
 
 	// Calculate the SMF size we'll need
-	uint32 dataSize = seqFile.size() - 15;
-	uint32 actualSize = dataSize + 7 + 22;
+	const uint32 dataSize{static_cast<uint32>(seqFile.size()) - 15};
+	constexpr uint32 headerSize{22};
+	constexpr uint32 tempoEventSize{7};
+	constexpr uint32 programChangeSize{3 * 16};
+	const uint32 actualSize{dataSize + headerSize + tempoEventSize + programChangeSize};
 
 	// Resize the buffer if necessary
 	midiData = _vm->_music->ResizeMidiBuffer(actualSize);
 
+	// This keeps track of the write pointer
+	struct SmfWriter {
+		uint8 *ptr;
+
+		void writeUint8(const uint8 value) {
+			*ptr = value;
+			ptr += 1;
+		}
+
+		void writeUint16(const uint16 value) {
+			WRITE_BE_UINT16(ptr, value);
+			ptr += 2;
+		}
+
+		void writeUint24(const uint32 value) {
+			WRITE_BE_UINT24(ptr, value);
+			ptr += 3;
+		}
+
+		void writeUint32(const uint32 value) {
+			WRITE_BE_UINT32(ptr, value);
+			ptr += 4;
+		}
+	};
+	SmfWriter smfWriter{midiData};
+
 	// Now construct the header
-	WRITE_BE_UINT32(midiData, MKTAG('M', 'T', 'h', 'd'));
-	WRITE_BE_UINT32(midiData + 4, 6); // header size
-	WRITE_BE_UINT16(midiData + 8, 0); // type 0
-	WRITE_BE_UINT16(midiData + 10, 1); // one track
-	WRITE_BE_UINT16(midiData + 12, ppqn);
-	WRITE_BE_UINT32(midiData + 14, MKTAG('M', 'T', 'r', 'k'));
-	WRITE_BE_UINT32(midiData + 18, dataSize + 7); // SEQ data size + tempo change event size
+	smfWriter.writeUint32(MKTAG('M', 'T', 'h', 'd'));
+	smfWriter.writeUint32(6); // header size
+	smfWriter.writeUint16(0); // type 0
+	smfWriter.writeUint16(1); // one track
+	smfWriter.writeUint16(ppqn);
+	smfWriter.writeUint32(MKTAG('M', 'T', 'r', 'k'));
+	smfWriter.writeUint32(actualSize - headerSize); // SEQ data size + tempo change event size + program changes
 
 	// Add in a fake tempo change event
-	WRITE_BE_UINT32(midiData + 22, 0x00FF5103); // no delta, meta event, tempo change, param size = 3
-	WRITE_BE_UINT16(midiData + 26, tempo >> 8);
-	midiData[28] = tempo & 0xFF;
+	smfWriter.writeUint8(0x00); // no delta
+	smfWriter.writeUint8(0xFF); // meta event
+	smfWriter.writeUint8(0x51); // tempo change
+	smfWriter.writeUint8(0x03); // param size = 3
+	smfWriter.writeUint24(tempo);
+
+	// Set the instrument per channel
+	for (uint8 i = 0; i < 16; i++) {
+		smfWriter.writeUint8(0x00); // no delta
+		smfWriter.writeUint8(MIDI_COMMAND_PROGRAM_CHANGE | i); // Program change for channel
+		smfWriter.writeUint8(i); // The new program (instrument)
+	}
 
 	// Now copy in the rest of the events
-	seqFile.read(midiData + 29, dataSize);
+	seqFile.read(smfWriter.ptr, dataSize);
 	seqFile.close();
 
 	MidiParser *parser = MidiParser::createParser_SMF();
